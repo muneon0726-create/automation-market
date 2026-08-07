@@ -62,4 +62,93 @@ def fetch_stooq(sym):
         raise ValueError("stooq: CSVでない応答 (bot検証の可能性)")
     rows = list(csv.DictReader(io.StringIO(text)))
     return [
-        {"Date":
+        {"Date": r["Date"], "Open": r["Open"], "High": r["High"],
+         "Low": r["Low"], "Close": r["Close"]}
+        for r in rows if r.get("Close") not in (None, "", "0")
+    ]
+
+
+def fetch_yahoo(sym):
+    import yfinance as yf
+    df = yf.download(sym, period="max", interval="1d",
+                     auto_adjust=True, progress=False)
+    if df is None or len(df) == 0:
+        raise ValueError("yahoo: 空の応答")
+    if hasattr(df.columns, "get_level_values") and df.columns.nlevels > 1:
+        df.columns = df.columns.get_level_values(0)
+    out = []
+    for idx, r in df.iterrows():
+        out.append({"Date": idx.strftime("%Y-%m-%d"),
+                    "Open": f"{float(r['Open']):.4f}", "High": f"{float(r['High']):.4f}",
+                    "Low": f"{float(r['Low']):.4f}", "Close": f"{float(r['Close']):.4f}"})
+    return out
+
+
+def fetch_fred(series):
+    url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series}&cosd=2016-01-01"
+    text = http_get(url)
+    rows = list(csv.DictReader(io.StringIO(text)))
+    out = []
+    for r in rows:
+        vals = list(r.values())
+        if len(vals) >= 2 and vals[1] not in ("", ".", None):
+            out.append({"Date": vals[0], "Open": "", "High": "",
+                        "Low": "", "Close": vals[1]})
+    if not out:
+        raise ValueError("fred: データなし")
+    return out
+
+
+def validate(rows, name, max_stale_days=7):
+    if len(rows) < 50:
+        raise ValueError(f"行数不足: {len(rows)}")
+    last = rows[-1]
+    d = datetime.date.fromisoformat(last["Date"])
+    if (TODAY - d).days > max_stale_days:
+        raise ValueError(f"鮮度不良: 最終日 {d}")
+    for r in rows[-250:]:
+        dd = datetime.date.fromisoformat(r["Date"])
+        if dd.weekday() >= 5:
+            raise ValueError(f"週末の日付が混入: {dd}")
+        if r["Open"]:  # OHLCあり系列のみ
+            o, h, l, c = (float(r[k]) for k in ("Open", "High", "Low", "Close"))
+            if not (l <= o <= h and l <= c <= h and l > 0):
+                raise ValueError(f"OHLC不整合: {r['Date']}")
+    return True
+
+
+def main():
+    os.makedirs("data", exist_ok=True)
+    errors = []
+    for name, (stooq_sym, yahoo_sym, fred_series) in SERIES.items():
+        sources = []
+        if stooq_sym:
+            sources.append(("stooq", lambda s=stooq_sym: fetch_stooq(s)))
+        if yahoo_sym:
+            sources.append(("yahoo", lambda s=yahoo_sym: fetch_yahoo(s)))
+        if fred_series:
+            sources.append(("fred", lambda s=fred_series: fetch_fred(s)))
+        ok = False
+        errs = []
+        for src_name, fn in sources:
+            try:
+                rows = fn()
+                validate(rows, name)
+                with open(f"data/{name}.csv", "w", newline="") as f:
+                    w = csv.DictWriter(f, fieldnames=["Date", "Open", "High", "Low", "Close"])
+                    w.writeheader()
+                    w.writerows(rows)
+                print(f"OK  {name:8s} <- {src_name:6s} rows={len(rows)} last={rows[-1]['Date']}")
+                ok = True
+                break
+            except Exception as e:
+                errs.append(f"{src_name}: {e}")
+        if not ok:
+            errors.append(f"{name}: " + " | ".join(errs))
+            print(f"NG  {name}: " + " | ".join(errs), file=sys.stderr)
+    if errors:
+        sys.exit("FETCH ERRORS:\n" + "\n".join(errors))
+
+
+if __name__ == "__main__":
+    main()
