@@ -20,7 +20,7 @@ import urllib.request
 SERIES = {
     # 指数・FX・VIX
     "nkx":    ("^nkx",    "^N225", None),         # 日経平均 OHLC
-    "spx":    (None,      None,    "SP500"),      # S&P500 公式終値のみ
+    "spx":    (None,      "^GSPC", "SP500"),      # S&P500 (Yahoo=指数そのもの, FRED=公式終値)
     "ndq":    ("^ndq",    "^IXIC", "NASDAQCOM"),  # NASDAQ総合
     "usdjpy": ("usdjpy",  "USDJPY=X", "DEXJPUS"), # ドル円
     "vix":    (None,      "^VIX",  "VIXCLS"),     # VIX
@@ -43,16 +43,25 @@ SERIES = {
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
 TODAY = datetime.date.today()
 
+# 為替はYahooのOHLCにノイズ行があるため整合チェックを免除（分析には終値のみ使用）
+NO_OHLC_CHECK = {"usdjpy"}
 
-def http_get(url, referer=None):
+
+def http_get(url, referer=None, retries=3):
     headers = {"User-Agent": UA, "Accept-Encoding": "identity"}
     if referer:
         headers["Referer"] = referer
-    req = urllib.request.Request(url, headers=headers)
-    raw = urllib.request.urlopen(req, timeout=60).read()
-    if raw[:2] == b"\x1f\x8b":  # gzip圧縮されていたら解凍 (FRED対策)
-        raw = gzip.decompress(raw)
-    return raw.decode("utf-8", "replace")
+    last_err = None
+    for i in range(retries):
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            raw = urllib.request.urlopen(req, timeout=90).read()
+            if raw[:2] == b"\x1f\x8b":  # gzip圧縮されていたら解凍 (FRED対策)
+                raw = gzip.decompress(raw)
+            return raw.decode("utf-8", "replace")
+        except Exception as e:
+            last_err = e
+    raise last_err
 
 
 def fetch_stooq(sym):
@@ -110,7 +119,7 @@ def validate(rows, name, max_stale_days=7):
         dd = datetime.date.fromisoformat(r["Date"])
         if dd.weekday() >= 5:
             raise ValueError(f"週末の日付が混入: {dd}")
-        if r["Open"]:  # OHLCあり系列のみ
+        if r["Open"] and name not in NO_OHLC_CHECK:  # OHLCあり系列のみ
             o, h, l, c = (float(r[k]) for k in ("Open", "High", "Low", "Close"))
             if not (l <= o <= h and l <= c <= h and l > 0):
                 raise ValueError(f"OHLC不整合: {r['Date']}")
